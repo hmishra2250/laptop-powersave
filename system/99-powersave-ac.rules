@@ -1,0 +1,1 @@
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", RUN+="/bin/systemctl --no-block start powersave-ac.service"

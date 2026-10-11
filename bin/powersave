@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# powersave - battery modes for an Intel + NVIDIA laptop that also runs as a server.
+#
+# The idle NVIDIA dGPU can draw more than the whole desktop session. It cannot be
+# powered down while Xorg/gnome-shell/mutter hold nvidia_drm open, so the deeper
+# tiers either restart the session on the Intel GPU (save --gpu-off, which runs
+# `prime-select intel`) or stop the graphical session (headless). Once nothing
+# holds the driver, the modules unload and the card can drop to D3cold.
+#
+# Tiers, least disruptive first:
+#   limit             CPU cap, turbo off, dim screen, device power saving (AC hook does this)
+#   save              also stops containers, listed services and apps
+#   save --gpu-off    also switches PRIME to Intel and restarts gdm (one logout)
+#   headless          also stops gdm; console only
+#
+#   status    battery, draw, runtime estimate, what was stopped
+#   restore   undo what this script changed and restart what it stopped
+#
+# Settings: /etc/powersave.conf, then ~/.config/powersave/config.
+# Only things this script stopped are restarted by `restore` (state is recorded).
+set -uo pipefail
+
+STATE=~/.local/state/powersave
+HOOK_STATE=/var/lib/powersave   # written by the root AC hook (powersave-ac)
+PSTATE=/sys/devices/system/cpu/intel_pstate
+
+# Defaults; see system/powersave.conf for what each one means.
+CAP_PCT=50; CAP_BRIGHT=40
+BACKLIGHT=intel_backlight
+DGPU_PCI=
+WIFI_IF=
+SYS_UNITS="docker.socket docker.service containerd.service ModemManager.service \
+virtlockd.socket virtlogd.socket virtlockd.service virtlogd.service \
+kerneloops.service fwupd.service unattended-upgrades.service bluetooth.service"
+USER_UNITS=
+HEADLESS_USER_UNITS=
+APPS="slack zoom obsidian spotify discord"
+KEEP_EXTRA=
+POST_RESTORE_HOOK=
+# shellcheck source=/dev/null
+[[ -r /etc/powersave.conf ]] && . /etc/powersave.conf
+# shellcheck source=/dev/null
+[[ -r ~/.config/powersave/config ]] && . ~/.config/powersave/config
+
+# First NVIDIA display controller (vendor 0x10de, class 0x03xxxx) in sysfs.
+find_dgpu() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [[ $(cat "$d/vendor" 2>/dev/null) == 0x10de && $(cat "$d/class" 2>/dev/null) == 0x03* ]] \
+      && { basename "$d"; return; }
+  done
+}
+
+wifi_ifaces() {
+  if [[ -n $WIFI_IF ]]; then echo "$WIFI_IF"; return; fi
+  local d
+  for d in /sys/class/net/*/wireless; do [[ -d $d ]] && basename "$(dirname "$d")"; done
+}
+
+BL=/sys/class/backlight/$BACKLIGHT
+DGPU=${DGPU_PCI:-$(find_dgpu)}
+mkdir -p "$STATE"
+
+say() { printf '  %s\n' "$*"; }
+hdr() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+battery() {
+  local dev rate energy pct
+  dev=$(upower -e 2>/dev/null | grep -m1 BAT) || return
+  eval "$(upower -i "$dev" 2>/dev/null | awk -F: '
+    /energy:/        {gsub(/ |Wh/,"",$2); print "energy="$2}
+    /energy-rate:/   {gsub(/ |W/,"",$2);  print "rate="$2}
+    /percentage:/    {gsub(/ |%/,"",$2);  print "pct="$2}
+    /state:/         {gsub(/ /,"",$2);    print "st="$2}')"
+  if [[ ${st:-} == discharging ]]; then
+    printf '  battery %s%% (on battery)  draw %sW' "${pct:-?}" "${rate:-?}"
+    [[ -n "${rate:-}" && -n "${energy:-}" ]] && (( $(echo "${rate:-0} > 0" | bc -l) )) \
+      && printf '  ->  %.1f h remaining' "$(echo "$energy / $rate" | bc -l)"
+  else
+    printf '  battery %s%% (%s, on AC - draw figure is charge rate, not consumption)' "${pct:-?}" "${st:-?}"
+  fi
+  echo
+}
+
+# Try to release the dGPU without touching anything persistent. Only succeeds if
+# nothing holds nvidia_drm (i.e. the session already came up on Intel, or gdm is down).
+gpu_release() {
+  lsmod | grep -q '^nvidia' || { say "dGPU: already unloaded ($(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null))"; return 0; }
+  sudo systemctl stop nvidia-persistenced 2>/dev/null
+  for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do sudo modprobe -r "$m" 2>/dev/null; done
+  if lsmod | grep -q '^nvidia'; then
+    say "dGPU: still held by the display session (~10W)"
+    say "  -> run 'powersave save --gpu-off' to reclaim it (costs one logout)"
+    return 1
+  fi
+  sudo sh -c "echo auto > /sys/bus/pci/devices/$DGPU/power/control" 2>/dev/null
+  sleep 2
+  say "dGPU: unloaded, now $(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null) (~10W saved)"
+}
+
+# Switch PRIME to Intel-only and restart the session so nvidia is never bound.
+# Reversible: restore puts the previous mode back.
+gpu_off_persistent() {
+  command -v prime-select >/dev/null || { say "prime-select not available"; return 1; }
+  local cur; cur=$(prime-select query 2>/dev/null)
+  [[ $cur == intel ]] || echo "$cur" > "$STATE/prime_mode"
+  hdr "switching graphics to Intel-only"
+  say "This logs you out (~20s). Your desktop and browser come back on the iGPU."
+  say "SAVE YOUR WORK. Terminal work survives if it is inside tmux."
+  if [[ ${FORCE:-0} != 1 ]]; then
+    read -r -p "  type YES to continue: " ok
+    [[ $ok == YES ]] || { say "aborted"; return 1; }
+  fi
+  sudo prime-select intel >/dev/null 2>&1 && say "prime mode: $cur -> intel"
+  sudo systemctl restart gdm 2>/dev/null
+}
+
+cmd_status() {
+  hdr "power"; battery
+  [[ -r $PSTATE/no_turbo ]] && say "cpu: turbo=$([[ $(cat $PSTATE/no_turbo) == 1 ]] && echo off || echo on) max_perf=$(cat $PSTATE/max_perf_pct)%"
+  [[ -r $BL/brightness ]] && say "screen: $(( $(cat $BL/brightness) * 100 / $(cat $BL/max_brightness) ))%"
+  if lsmod | grep -q '^nvidia'; then
+    say "dGPU: driver LOADED, $(nvidia-smi --query-gpu=power.draw --format=csv,noheader 2>/dev/null || echo '?') (power state $(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null))"
+  else
+    say "dGPU: driver unloaded, power state $(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null) <- powered down"
+  fi
+  say "graphical session: $(systemctl is-active gdm 2>/dev/null)  prime: $(prime-select query 2>/dev/null || echo n/a)"
+  say "containers running: $(docker ps -q 2>/dev/null | wc -l)"
+  hdr "stopped by this tool"
+  for f in "$STATE"/*; do [[ -e $f ]] || { say "(nothing)"; break; }; say "$(basename "$f"): $(tr '\n' ' ' < "$f")"; done
+  echo
+}
+
+# Add an item to a restore list, once. The lists only grow until restore reads
+# them, so a second, deeper tier (save, then save --gpu-off or headless) keeps
+# what the first one stopped.
+remember() { grep -qxF "$2" "$STATE/$1" 2>/dev/null || echo "$2" >> "$STATE/$1"; }
+
+stop_workloads() {
+  local c u a stopped
+  hdr "stopping background workloads"
+  # remember when background work first stopped, for POST_RESTORE_HOOK
+  [[ -f $STATE/stopped_at ]] || date -Iseconds > "$STATE/stopped_at"
+  stopped=$(docker ps --format '{{.Names}}' 2>/dev/null)
+  if [[ -n $stopped ]]; then
+    say "containers: ${stopped//$'\n'/ }"
+    # shellcheck disable=SC2086  # one argument per container name
+    docker stop $stopped >/dev/null 2>&1
+    for c in $stopped; do remember containers "$c"; done
+  fi
+  stopped=
+  for u in $USER_UNITS; do
+    if [[ $(systemctl --user is-active "$u" 2>/dev/null) == active ]]; then
+      systemctl --user stop "$u" 2>/dev/null && { remember user_units "$u"; stopped="$stopped $u"; }
+    fi
+  done
+  [[ -n $stopped ]] && say "user units:$stopped"
+  stopped=
+  for a in $APPS; do
+    if pgrep -x "$a" >/dev/null 2>&1 || pgrep -f "/$a" >/dev/null 2>&1; then
+      pkill -x "$a" 2>/dev/null; pkill -f "/opt/$a" 2>/dev/null; pkill -f "/usr/lib/$a" 2>/dev/null
+      remember apps "$a"; stopped="$stopped $a"
+    fi
+  done
+  [[ -n $stopped ]] && say "apps closed:$stopped"
+  stopped=
+  for u in $SYS_UNITS; do
+    if [[ $(systemctl is-active "$u" 2>/dev/null) == active ]]; then
+      sudo systemctl stop "$u" 2>/dev/null && { remember sys_units "$u"; stopped="$stopped $u"; }
+    fi
+  done
+  [[ -n $stopped ]] && say "system units:$stopped"
+  return 0
+}
+
+tune_hardware() {  # $1 = max_perf_pct, $2 = brightness percent
+  hdr "tuning hardware"
+  # Record the values to restore. If the AC hook has already capped the CPU and
+  # dimmed the screen, the live values are its caps, so take the originals it
+  # saved instead; otherwise restore would put the caps back while on AC.
+  local hook=0; [[ -f $HOOK_STATE/active ]] && hook=1
+  if [[ ! -f $STATE/cpu ]]; then
+    if (( hook )) && [[ -r $HOOK_STATE/cpu ]]; then cp "$HOOK_STATE/cpu" "$STATE/cpu"
+    else echo "$(cat $PSTATE/no_turbo) $(cat $PSTATE/max_perf_pct)" > "$STATE/cpu"; fi
+  fi
+  sudo sh -c "echo 1 > $PSTATE/no_turbo; echo $1 > $PSTATE/max_perf_pct" 2>/dev/null
+  say "cpu: turbo off, max_perf_pct=$1"
+  if [[ -w $BL/brightness || -e $BL/brightness ]]; then
+    if [[ ! -f $STATE/brightness ]]; then
+      if (( hook )) && [[ -r $HOOK_STATE/brightness ]]; then cp "$HOOK_STATE/brightness" "$STATE/brightness"
+      else cat "$BL/brightness" > "$STATE/brightness"; fi
+    fi
+    sudo sh -c "echo $(( $(cat $BL/max_brightness) * $2 / 100 )) > $BL/brightness" 2>/dev/null
+    say "screen: ${2}%"
+  fi
+  # shellcheck disable=SC2016  # expanded by the inner sh, not here
+  sudo sh -c '
+    for d in /sys/bus/pci/devices/*/power/control /sys/bus/usb/devices/*/power/control; do echo auto > "$d" 2>/dev/null; done
+    for p in /sys/class/scsi_host/host*/link_power_management_policy; do echo med_power_with_dipm > "$p" 2>/dev/null; done
+    echo 1 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
+    if command -v iw >/dev/null; then for w in "$@"; do iw dev "$w" set power_save on 2>/dev/null; done; fi
+    exit 0' sh $(wifi_ifaces) 2>/dev/null
+  say "runtime PM: pci/usb auto, disk+audio+wifi power saving on"
+}
+
+
+# --- aggressive mode -----------------------------------------------------
+# `save --aggressive` keeps ONLY: this shell, tmux, node, the terminal, the
+# browser, the desktop shell itself, and anything matching KEEP_EXTRA. Everything else the user owns is
+# asked to quit (SIGTERM). Kernel threads, systemd, and session infrastructure
+# are never touched. (headless mode needs none of this: stopping gdm already
+# tears down every GUI app.)
+KEEP_RE='/node|tmux|gnome-terminal|chromium|firefox|/chrome|Xorg|gnome-shell|mutter|gdm|systemd|dbus|pipewire|wireplumber|pulseaudio|gvfs|gcr|keyring|polkit|ssh|bash|zsh|sudo|powersave|at-spi|ibus|xdg-desktop-portal|snapd|tracker-miner|gsd-|goa-|gnome-session|gnome-keyring'
+[[ -n $KEEP_EXTRA ]] && KEEP_RE="$KEEP_RE|$KEEP_EXTRA"
+
+stop_everything_else() {
+  local dry=$1 hits=0
+  hdr "$([[ $dry == dry ]] && echo 'would close (dry run)' || echo 'closing other applications')"
+  while read -r pid rss comm args; do
+    [[ -z ${pid:-} ]] && continue
+    (( pid == $$ )) && continue
+    [[ $args =~ $KEEP_RE ]] && continue
+    [[ $args == \[* ]] && continue          # kernel threads
+    (( rss < 20000 )) && continue            # ignore small helpers
+    say "$(printf '%5.0fMB  %s' "$((rss/1024))" "${comm}")"
+    hits=$((hits+1))
+    [[ $dry == dry ]] || { remember apps "$comm"; kill -TERM "$pid" 2>/dev/null; }
+  done < <(ps -u "$USER" -o pid=,rss=,comm=,args= --no-headers | sort -k2 -rn)
+  (( hits == 0 )) && say "(nothing else worth closing)"
+}
+
+# TIER 0 - what the AC hook applies automatically. Purely hardware limits:
+# everything keeps running, just slower and dimmer.
+cmd_limit() {
+  hdr "battery limits (nothing stopped)"
+  tune_hardware "${LIMIT_PCT:-$CAP_PCT}" "${LIMIT_BRIGHT:-$CAP_BRIGHT}"
+  gpu_release || true
+  hdr "state"; battery
+  say "Everything still running. Deeper tiers:"
+  say "  powersave save             stop containers, services and apps"
+  say "  powersave save --gpu-off   + reclaim the ~10W dGPU (one logout)"
+}
+
+cmd_unlimit() {
+  hdr "removing battery limits"
+  if [[ -f $STATE/cpu ]]; then
+    read -r nt mp < "$STATE/cpu"
+    sudo sh -c "echo $nt > $PSTATE/no_turbo; echo $mp > $PSTATE/max_perf_pct" 2>/dev/null
+    rm -f "$STATE/cpu"; say "cpu restored"
+  else
+    sudo sh -c "echo 0 > $PSTATE/no_turbo; echo 100 > $PSTATE/max_perf_pct" 2>/dev/null; say "cpu uncapped"
+  fi
+  if [[ -f $STATE/brightness ]]; then
+    sudo sh -c "echo $(cat "$STATE/brightness") > $BL/brightness" 2>/dev/null
+    rm -f "$STATE/brightness"; say "brightness restored"
+  fi
+  hdr "state"; battery
+}
+
+cmd_save() {
+  if [[ ${2:-} == --dry-run ]]; then stop_everything_else dry; return 0; fi
+  stop_workloads
+  [[ ${2:-} == --aggressive ]] && stop_everything_else live
+  tune_hardware 60 30
+  hdr "gpu"
+  gpu_release || true
+  if [[ ${2:-} == --gpu-off ]]; then gpu_off_persistent && return 0; fi
+  hdr "done"; battery
+  if lsmod | grep -q '^nvidia'; then
+    say "Next tier:  powersave save --gpu-off    (~10W, one logout, keeps browser)"
+  else
+    say "Next tier:  powersave headless          (~8W, console only, no browser)"
+  fi
+}
+
+cmd_headless() {
+  if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    hdr "refusing to run"
+    say "This stops the graphical session and would kill this terminal."
+    say "Switch to a text console first:  Ctrl+Alt+F3, log in, then re-run."
+    say "(Return to the desktop later with Ctrl+Alt+F2 if it is still running.)"
+    return 1
+  fi
+  stop_workloads
+  for u in $HEADLESS_USER_UNITS; do
+    if [[ $(systemctl --user is-active "$u" 2>/dev/null) == active ]]; then
+      systemctl --user stop "$u" 2>/dev/null && remember user_units "$u" && say "stopped $u"
+    fi
+  done
+  hdr "stopping graphical session"
+  if [[ $(systemctl is-active gdm 2>/dev/null) == active ]]; then
+    echo gdm.service > "$STATE/display_manager"
+    sudo systemctl stop gdm 2>/dev/null
+    say "gdm stopped (this frees nvidia_drm)"
+    sleep 3
+  fi
+  hdr "powering down dGPU"
+  sudo systemctl stop nvidia-persistenced 2>/dev/null
+  for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do sudo modprobe -r "$m" 2>/dev/null; done
+  if lsmod | grep -q '^nvidia'; then
+    say "still loaded; holders:"; sudo fuser -v /dev/nvidia* 2>&1 | head -5   # -v only: never -k
+  else
+    sudo sh -c "echo auto > /sys/bus/pci/devices/$DGPU/power/control" 2>/dev/null
+    sleep 2
+    say "modules unloaded, power state: $(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null)"
+  fi
+  tune_hardware 40 15
+  hdr "done"; battery
+  say "Work here in tmux:   tmux new -s work    (detach C-b d, reattach: tmux a -t work)"
+}
+
+
+# Run the optional POST_RESTORE_HOOK with the window background work was stopped.
+run_post_restore_hook() {
+  [[ -f $STATE/stopped_at ]] || return 0
+  if [[ -z $POST_RESTORE_HOOK ]]; then rm -f "$STATE/stopped_at"; return 0; fi
+  hdr "post-restore hook"
+  if POWERSAVE_STOPPED_AT=$(cat "$STATE/stopped_at") POWERSAVE_RESTORED_AT=$(date -Iseconds) \
+       bash -c "$POST_RESTORE_HOOK"; then
+    say "hook ran"; rm -f "$STATE/stopped_at"
+  else
+    say "hook failed; it runs again on the next 'powersave restore'"
+  fi
+}
+
+# One-command switch to the console tier. Records the VT you came from, arms a
+# marker that ~/.profile picks up on the next console login, then switches VT.
+# You type your password once; everything after that is automatic.
+cmd_go_headless() {
+  hdr "switch to console (headless) mode"
+  say "This drops the desktop and runs 'powersave headless' automatically."
+  say "Your browser closes. Terminal work survives if it is in tmux."
+  if [[ ${FORCE:-0} != 1 ]]; then
+    read -r -p "  type YES to continue: " ok
+    [[ $ok == YES ]] || { say "aborted"; return 1; }
+  fi
+  fgconsole 2>/dev/null > "$STATE/return_vt" || echo 2 > "$STATE/return_vt"
+  loginctl enable-linger "$USER" 2>/dev/null && say "linger enabled (background work survives logout)"
+  touch "$STATE/pending-headless"
+  say "switching to tty3 - log in there and it runs itself"
+  say "come back later with: powersave restore"
+  sleep 2
+  sudo chvt 3 2>/dev/null || chvt 3 2>/dev/null || say "could not switch VT - press Ctrl+Alt+F3 manually"
+}
+
+cmd_restore() {
+  hdr "restoring"
+  if [[ -f $HOOK_STATE/active ]]; then
+    # Still on battery: go back to the AC hook's limits; the hook lifts them when AC returns.
+    sudo sh -c "echo 1 > $PSTATE/no_turbo; echo $CAP_PCT > $PSTATE/max_perf_pct" 2>/dev/null
+    [[ -r $BL/max_brightness ]] && sudo sh -c "echo $(( $(cat "$BL/max_brightness") * CAP_BRIGHT / 100 )) > $BL/brightness" 2>/dev/null
+    say "on battery: back to the automatic limits (cpu ${CAP_PCT}%, screen ${CAP_BRIGHT}%)"
+    rm -f "$STATE/cpu" "$STATE/brightness"
+  fi
+  if [[ -f $STATE/cpu ]]; then
+    read -r nt mp < "$STATE/cpu"
+    sudo sh -c "echo $nt > $PSTATE/no_turbo; echo $mp > $PSTATE/max_perf_pct" 2>/dev/null
+    say "cpu restored (turbo=$([[ $nt == 1 ]] && echo off || echo on), max_perf=$mp%)"; rm -f "$STATE/cpu"
+  fi
+  if [[ -f $STATE/brightness ]]; then
+    sudo sh -c "echo $(cat "$STATE/brightness") > $BL/brightness" 2>/dev/null
+    say "brightness restored"; rm -f "$STATE/brightness"
+  fi
+  if [[ -f $STATE/prime_mode ]]; then
+    sudo prime-select "$(cat "$STATE/prime_mode")" >/dev/null 2>&1 \
+      && say "prime mode restored to $(cat "$STATE/prime_mode") (applies at next login)"
+    rm -f "$STATE/prime_mode"
+  fi
+  if ! lsmod | grep -q '^nvidia'; then
+    # Loading nvidia_modeset re-inits KMS and will kill an X session that came up
+    # on the iGPU. Only safe with no graphical session running.
+    if [[ $(systemctl is-active gdm 2>/dev/null) == active ]]; then
+      say "nvidia left unloaded on purpose: reloading it now would log you out."
+      say "  it comes back by itself at next boot/login, or run: sudo modprobe nvidia (no GUI running)"
+    else
+      sudo modprobe nvidia 2>/dev/null && sudo modprobe nvidia_modeset 2>/dev/null && say "nvidia driver reloaded"
+    fi
+  fi
+  [[ -s $STATE/sys_units ]]  && { while read -r u; do sudo systemctl start "$u" 2>/dev/null; done < "$STATE/sys_units"; say "system units restarted"; rm -f "$STATE/sys_units"; }
+  [[ -s $STATE/user_units ]] && { while read -r u; do systemctl --user start "$u" 2>/dev/null; done < "$STATE/user_units"; say "user units restarted"; rm -f "$STATE/user_units"; }
+  if [[ -s $STATE/containers ]]; then
+    sleep 3
+    docker start $(cat "$STATE/containers") >/dev/null 2>&1 && say "containers restarted: $(tr '\n' ' ' < "$STATE/containers")"
+    rm -f "$STATE/containers"
+  fi
+  run_post_restore_hook
+  rm -f "$STATE/pending-headless"
+  if [[ -f $STATE/display_manager ]]; then
+    sudo systemctl start gdm 2>/dev/null && say "graphical session restarted"
+    rm -f "$STATE/display_manager"
+    local vt; vt=$(cat "$STATE/return_vt" 2>/dev/null || echo 2)
+    sleep 4; sudo chvt "$vt" 2>/dev/null && say "switched back to VT $vt"
+    rm -f "$STATE/return_vt"
+  fi
+  rm -f "$STATE/apps"
+  hdr "done"; battery
+  say "Apps that were closed are not reopened - launch them yourself."
+}
+
+case "${1:-status}" in
+  status)   cmd_status ;;
+  go-headless) cmd_go_headless ;;
+  limit)    cmd_limit ;;
+  perf)     hdr "full performance"
+            sudo sh -c "echo 0 > $PSTATE/no_turbo; echo 100 > $PSTATE/max_perf_pct" 2>/dev/null
+            rm -f "$STATE/cpu"
+            say "turbo on, max_perf=100% (on battery this is ~30-45 min under load)"
+            battery ;;
+  unlimit)  cmd_unlimit ;;
+  save)     cmd_save "$@" ;;
+  headless) cmd_headless ;;
+  restore)  cmd_restore ;;
+  *) echo "usage: powersave {status | limit | unlimit | perf | save [--gpu-off|--aggressive|--dry-run] | go-headless | headless | restore}"; exit 1 ;;
+esac

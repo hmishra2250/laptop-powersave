@@ -1,0 +1,63 @@
+#!/bin/bash
+# Applies battery limits on AC loss, removes them on AC restore.
+# Nothing is stopped - all work keeps running, just capped.
+PSTATE=/sys/devices/system/cpu/intel_pstate
+VAR=/var/lib/powersave
+CAP_PCT=50; CAP_BRIGHT=40
+BACKLIGHT=intel_backlight; DGPU_PCI=; WIFI_IF=
+# shellcheck source=/dev/null
+[[ -r /etc/powersave.conf ]] && . /etc/powersave.conf
+BL=/sys/class/backlight/$BACKLIGHT
+DGPU=$DGPU_PCI
+if [[ -z $DGPU ]]; then   # first NVIDIA display controller
+  for d in /sys/bus/pci/devices/*; do
+    [[ $(cat "$d/vendor" 2>/dev/null) == 0x10de && $(cat "$d/class" 2>/dev/null) == 0x03* ]] \
+      && { DGPU=$(basename "$d"); break; }
+  done
+fi
+if [[ -z $WIFI_IF ]]; then
+  for d in /sys/class/net/*/wireless; do [[ -d $d ]] && WIFI_IF="$WIFI_IF $(basename "$(dirname "$d")")"; done
+fi
+mkdir -p "$VAR"
+
+on_ac() { for f in /sys/class/power_supply/A*/online /sys/class/power_supply/ADP*/online; do
+            [[ -r $f ]] && { [[ $(cat "$f") == 1 ]] && return 0 || return 1; }; done; return 0; }
+
+notify() {
+  local uid; uid=$(loginctl list-users --no-legend 2>/dev/null | awk '$2!="root"{print $1; exit}')
+  [[ -z $uid ]] && return 0
+  local user; user=$(id -nu "$uid" 2>/dev/null) || return 0
+  sudo -u "$user" DISPLAY=:1 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    notify-send -a powersave -u normal "$1" "$2" 2>/dev/null || true
+}
+
+if on_ac; then
+  [[ -f $VAR/active ]] || exit 0
+  read -r nt mp < "$VAR/cpu" 2>/dev/null || { nt=0; mp=100; }
+  echo "$nt" > $PSTATE/no_turbo 2>/dev/null
+  echo "$mp" > $PSTATE/max_perf_pct 2>/dev/null
+  [[ -f $VAR/brightness ]] && cat "$VAR/brightness" > $BL/brightness 2>/dev/null
+  rm -f "$VAR/active" "$VAR/cpu" "$VAR/brightness"
+  logger -t powersave "AC restored: limits removed"
+  notify "Power restored" "Full performance restored."
+else
+  [[ -f $VAR/active ]] && exit 0
+  echo "$(cat $PSTATE/no_turbo) $(cat $PSTATE/max_perf_pct)" > "$VAR/cpu"
+  cat $BL/brightness > "$VAR/brightness" 2>/dev/null
+  echo 1 > $PSTATE/no_turbo 2>/dev/null
+  echo $CAP_PCT > $PSTATE/max_perf_pct 2>/dev/null
+  [[ -r $BL/max_brightness ]] && echo $(( $(cat $BL/max_brightness) * CAP_BRIGHT / 100 )) > $BL/brightness 2>/dev/null
+  for d in /sys/bus/pci/devices/*/power/control /sys/bus/usb/devices/*/power/control; do echo auto > "$d" 2>/dev/null; done
+  for pp in /sys/class/scsi_host/host*/link_power_management_policy; do echo med_power_with_dipm > "$pp" 2>/dev/null; done
+  echo 1 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
+  if command -v iw >/dev/null; then for w in $WIFI_IF; do iw dev "$w" set power_save on 2>/dev/null; done; fi
+  # free the dGPU only if nothing holds it (never forces, never kills)
+  if lsmod | grep -q '^nvidia' && ! fuser -s /dev/nvidia* 2>/dev/null; then
+    for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do modprobe -r "$m" 2>/dev/null; done
+    lsmod | grep -q '^nvidia' || [[ -z $DGPU ]] || echo auto > /sys/bus/pci/devices/$DGPU/power/control 2>/dev/null
+  fi
+  touch "$VAR/active"
+  logger -t powersave "on battery: CPU capped ${CAP_PCT}%, turbo off, screen ${CAP_BRIGHT}%"
+  notify "On battery - saver mode" "CPU capped, screen dimmed. Everything still running.
+For much longer runtime: powersave save --gpu-off"
+fi

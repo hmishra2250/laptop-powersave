@@ -1,0 +1,5 @@
+[Unit]
+Description=Apply or remove battery power limits when AC changes
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/powersave-ac
