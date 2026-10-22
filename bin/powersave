@@ -14,7 +14,8 @@
 #   headless          also stops gdm; console only
 #
 #   status    battery, draw, runtime estimate, what was stopped
-#   restore   undo what this script changed and restart what it stopped
+#   restore   undo what this script changed; restart, offer or leave what it stopped
+#             (per ~/.config/powersave/workloads; --yes / --no answer the prompt)
 #
 # Settings: /etc/powersave.conf, then ~/.config/powersave/config.
 # Only things this script stopped are restarted by `restore` (state is recorded).
@@ -63,6 +64,101 @@ mkdir -p "$STATE"
 
 say() { printf '  %s\n' "$*"; }
 hdr() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# --- workloads -------------------------------------------------------------
+# What `save` stops, what it keeps running, and how `restore` brings each thing
+# back (auto | ask | never) comes from ~/.config/powersave/workloads (template:
+# system/workloads.example). Without that file the lists above apply and
+# everything restarts as before.
+WORKLOADS=${POWERSAVE_WORKLOADS:-$HOME/.config/powersave/workloads}
+declare -A SET=([ask_timeout]=30 [ask_default]=yes [unattended]=skip [backfill_max_age_h]=24 [unlisted_container]=auto)
+WL=()                       # "kind|name-or-glob|policy|flags|label", first match wins
+WL_SOURCE="built-in defaults"
+TTY=${POWERSAVE_TTY:-/dev/tty}   # where restore reads its answers
+
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+set_setting() {  # set_setting KEY VALUE, keeping the default when VALUE is invalid
+  local ok=1
+  case $1 in
+    ask_timeout)        [[ $2 =~ ^[1-9][0-9]*$ ]] || ok=0 ;;
+    backfill_max_age_h) [[ $2 =~ ^[0-9]+$ ]] || ok=0 ;;
+    ask_default)        [[ $2 == yes || $2 == no ]] || ok=0 ;;
+    unattended)         [[ $2 == skip || $2 == restart ]] || ok=0 ;;
+    unlisted_container) [[ $2 == auto || $2 == ask || $2 == never ]] || ok=0 ;;
+  esac
+  if (( ok )); then SET[$1]=$2; else say "workloads: '$2' is not valid for $1 - keeping ${SET[$1]}"; fi
+}
+
+load_workloads() {
+  local raw line kind name policy flags extra label f fl
+  if [[ ! -r $WORKLOADS ]]; then
+    for name in $SYS_UNITS; do WL+=("system-unit|$name|auto||"); done
+    for name in $USER_UNITS; do WL+=("user-unit|$name|auto||"); done
+    for name in $HEADLESS_USER_UNITS; do WL+=("user-unit|$name|auto|headless|"); done
+    for name in $APPS; do WL+=("app|$name|never||"); done
+    # the CCTV recorder, so a coverage gap is still noticed without a workloads file
+    WL+=("container|cctv-edge-app-*|auto|backfill|Frigate, CCTV recorder"
+         "container|*frigate*|auto|backfill|Frigate, CCTV recorder")
+    return 0
+  fi
+  WL_SOURCE=$WORKLOADS
+  SET[unlisted_container]=ask
+  SYS_UNITS="" USER_UNITS="" HEADLESS_USER_UNITS="" APPS=""
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    line=${raw%%#*}; label=
+    [[ $raw == *#* ]] && label=$(trim "${raw#*#}")
+    label=${label//|//}
+    kind='' name='' policy='' flags='' extra=''
+    read -r kind name policy flags extra <<< "$line"
+    [[ -z $kind ]] && continue
+    case $kind in
+      container|user-unit|system-unit|app)
+        if [[ -z $name ]]; then say "workloads: ignored line without a name: $(trim "$line")"; continue; fi
+        if [[ $kind != container && $name == *[*?[]* ]]; then
+          say "workloads: ignored $kind '$name': globs work only for containers"; continue
+        fi
+        case $policy in auto|ask|never) ;;
+          *) say "workloads: '$policy' is not auto|ask|never for $name - treating it as ask"; policy=ask ;;
+        esac
+        [[ -n $extra ]] && say "workloads: ignored extra words after $name: $extra"
+        fl=
+        for f in ${flags//,/ }; do
+          case $f in keep|backfill|headless) fl+=${fl:+,}$f ;;
+            *) say "workloads: ignored unknown flag '$f' on $name" ;;
+          esac
+        done
+        WL+=("$kind|$name|$policy|$fl|$label")
+        has_flag keep "$fl" && continue
+        case $kind in
+          system-unit) SYS_UNITS+=" $name" ;;
+          user-unit)   if has_flag headless "$fl"; then HEADLESS_USER_UNITS+=" $name"; else USER_UNITS+=" $name"; fi ;;
+          app)         APPS+=" $name" ;;
+        esac ;;
+      *) if [[ -n ${SET[$kind]+x} && -n $name ]]; then set_setting "$kind" "$name"
+         else say "workloads: ignored unknown line: $(trim "$line")"; fi ;;
+    esac
+  done < "$WORKLOADS"
+}
+
+# workload_rule KIND NAME -> "pattern|policy|flags|label" of the first matching line
+workload_rule() {
+  local e k p pol fl lb
+  for e in "${WL[@]}"; do
+    IFS='|' read -r k p pol fl lb <<< "$e"
+    # shellcheck disable=SC2053  # $p is a glob on purpose
+    [[ $k == "$1" && $2 == $p ]] && { echo "$p|$pol|$fl|$lb"; return; }
+  done
+  case $1 in
+    container) echo "$2|${SET[unlisted_container]}||" ;;
+    app)       echo "$2|never||" ;;
+    *)         echo "$2|auto||" ;;
+  esac
+}
+has_flag() { [[ ,$2, == *,$1,* ]]; }   # has_flag FLAG "a,b,c"
+state_file() { case $1 in system-unit) echo "$STATE/sys_units";; user-unit) echo "$STATE/user_units";; container) echo "$STATE/containers";; app) echo "$STATE/apps";; esac; }
+kind_name() { case $1 in system-unit) echo "system units";; user-unit) echo "user units";; container) echo "containers";; app) echo "apps";; esac; }
+interactive() { [[ -t 0 ]]; }
 
 battery() {
   local dev rate energy pct
@@ -126,27 +222,98 @@ cmd_status() {
   fi
   say "graphical session: $(systemctl is-active gdm 2>/dev/null)  prime: $(prime-select query 2>/dev/null || echo n/a)"
   say "containers running: $(docker ps -q 2>/dev/null | wc -l)"
-  hdr "stopped by this tool"
-  for f in "$STATE"/*; do [[ -e $f ]] || { say "(nothing)"; break; }; say "$(basename "$f"): $(tr '\n' ' ' < "$f")"; done
+  say "workloads: from $WL_SOURCE"
+  status_stopped
   echo
+}
+
+hours_since() { echo $(( ($(date +%s) - $(date -d "$(cat "$1")" +%s 2>/dev/null || date +%s)) / 3600 )); }
+
+status_stopped() {
+  local kind f any=0 name
+  hdr "still stopped (restore offers them again)"
+  for kind in system-unit user-unit container; do
+    f=$(state_file "$kind")
+    [[ -s $f ]] && { say "$(kind_name "$kind"): $(tr '\n' ' ' < "$f")"; any=1; }
+  done
+  (( any )) || say "(nothing)"
+  [[ -s $STATE/apps ]] && say "apps closed (not reopened by restore): $(tr '\n' ' ' < "$STATE/apps")"
+  [[ -f $STATE/outage_start ]] && say "coverage gap since $(cat "$STATE/outage_start") ($(hours_since "$STATE/outage_start") h ago)"
+  [[ -f $STATE/stopped_at ]] && say "background work stopped since $(cat "$STATE/stopped_at") ($(hours_since "$STATE/stopped_at") h ago)"
+  for f in "$STATE"/*; do
+    [[ -e $f ]] || continue
+    name=$(basename "$f")
+    case $name in sys_units|user_units|containers|apps|outage_start|stopped_at) continue ;; esac
+    say "$name: $(tr '\n' ' ' < "$f")"
+  done
 }
 
 # Add an item to a restore list, once. The lists only grow until restore reads
 # them, so a second, deeper tier (save, then save --gpu-off or headless) keeps
 # what the first one stopped.
-remember() { grep -qxF "$2" "$STATE/$1" 2>/dev/null || echo "$2" >> "$STATE/$1"; }
+remember() { grep -qxF -- "$2" "$STATE/$1" 2>/dev/null || echo "$2" >> "$STATE/$1"; }
+# Drop an item from a restore list once it is running again (or set to never).
+forget() {
+  [[ -f $1 ]] || return 0
+  grep -vxF -- "$2" "$1" > "$1.tmp"; mv "$1.tmp" "$1"
+  [[ -s $1 ]] || rm -f "$1"
+}
+
+# Split the running containers by their rule: STOP_C and KEEP_C (keep flag).
+# RECORDER=1 when a container to stop has the backfill flag.
+split_containers() {
+  local c pat pol fl lb
+  STOP_C=() KEEP_C=() RECORDER=0
+  while read -r c; do
+    [[ -n $c ]] || continue
+    IFS='|' read -r pat pol fl lb <<< "$(workload_rule container "$c")"
+    if has_flag keep "$fl"; then KEEP_C+=("$c"); continue; fi
+    has_flag backfill "$fl" && RECORDER=1
+    STOP_C+=("$c")
+  done < <(docker ps --format '{{.Names}}' 2>/dev/null)
+}
+
+app_running() { pgrep -x "$1" >/dev/null 2>&1 || pgrep -f "/$1" >/dev/null 2>&1; }
+
+# save --dry-run: what save would stop and keep. Changes nothing.
+preview_workloads() {
+  local u a e k p pol fl lb su=() uu=() hu=() ap=() kept=()
+  hdr "save would stop (dry run, workloads from $WL_SOURCE)"
+  split_containers
+  for u in $SYS_UNITS; do [[ $(systemctl is-active "$u" 2>/dev/null) == active ]] && su+=("$u"); done
+  for u in $USER_UNITS; do [[ $(systemctl --user is-active "$u" 2>/dev/null) == active ]] && uu+=("$u"); done
+  for u in $HEADLESS_USER_UNITS; do [[ $(systemctl --user is-active "$u" 2>/dev/null) == active ]] && hu+=("$u"); done
+  for a in $APPS; do app_running "$a" && ap+=("$a"); done
+  say "containers: ${STOP_C[*]:-(none running)}"
+  (( RECORDER )) && say "  (a backfill recorder is among them: save would start a coverage gap)"
+  say "user units: ${uu[*]:-(none active)}"
+  (( ${#hu[@]} )) && say "user units, headless tier only: ${hu[*]}"
+  say "system units: ${su[*]:-(none active)}"
+  say "apps: ${ap[*]:-(none running)}"
+  for e in "${WL[@]}"; do
+    IFS='|' read -r k p pol fl lb <<< "$e"
+    [[ $k != container ]] && has_flag keep "$fl" && kept+=("$p")
+  done
+  kept=("${KEEP_C[@]}" "${kept[@]}")
+  say "kept running (keep): ${kept[*]:-(none)}"
+}
 
 stop_workloads() {
   local c u a stopped
   hdr "stopping background workloads"
   # remember when background work first stopped, for POST_RESTORE_HOOK
   [[ -f $STATE/stopped_at ]] || date -Iseconds > "$STATE/stopped_at"
-  stopped=$(docker ps --format '{{.Names}}' 2>/dev/null)
-  if [[ -n $stopped ]]; then
-    say "containers: ${stopped//$'\n'/ }"
-    # shellcheck disable=SC2086  # one argument per container name
-    docker stop $stopped >/dev/null 2>&1
-    for c in $stopped; do remember containers "$c"; done
+  split_containers
+  (( ${#KEEP_C[@]} )) && say "kept running (keep): ${KEEP_C[*]}"
+  if (( ${#STOP_C[@]} )); then
+    say "containers: ${STOP_C[*]}"
+    docker stop "${STOP_C[@]}" >/dev/null 2>&1
+    for c in "${STOP_C[@]}"; do remember containers "$c"; done
+  fi
+  # a stopped recorder (backfill flag) starts a coverage gap
+  if (( RECORDER )) && [[ ! -f $STATE/outage_start ]]; then
+    date -Iseconds > "$STATE/outage_start"
+    say "coverage gap starts $(cat "$STATE/outage_start")"
   fi
   stopped=
   for u in $USER_UNITS; do
@@ -157,7 +324,7 @@ stop_workloads() {
   [[ -n $stopped ]] && say "user units:$stopped"
   stopped=
   for a in $APPS; do
-    if pgrep -x "$a" >/dev/null 2>&1 || pgrep -f "/$a" >/dev/null 2>&1; then
+    if app_running "$a"; then
       pkill -x "$a" 2>/dev/null; pkill -f "/opt/$a" 2>/dev/null; pkill -f "/usr/lib/$a" 2>/dev/null
       remember apps "$a"; stopped="$stopped $a"
     fi
@@ -193,7 +360,7 @@ tune_hardware() {  # $1 = max_perf_pct, $2 = brightness percent
     sudo sh -c "echo $(( $(cat $BL/max_brightness) * $2 / 100 )) > $BL/brightness" 2>/dev/null
     say "screen: ${2}%"
   fi
-  # shellcheck disable=SC2016  # expanded by the inner sh, not here
+  # shellcheck disable=SC2016,SC2046  # expanded by the inner sh; one argument per interface
   sudo sh -c '
     for d in /sys/bus/pci/devices/*/power/control /sys/bus/usb/devices/*/power/control; do echo auto > "$d" 2>/dev/null; done
     for p in /sys/class/scsi_host/host*/link_power_management_policy; do echo med_power_with_dipm > "$p" 2>/dev/null; done
@@ -258,7 +425,7 @@ cmd_unlimit() {
 }
 
 cmd_save() {
-  if [[ ${2:-} == --dry-run ]]; then stop_everything_else dry; return 0; fi
+  if [[ ${2:-} == --dry-run ]]; then preview_workloads; stop_everything_else dry; return 0; fi
   stop_workloads
   [[ ${2:-} == --aggressive ]] && stop_everything_else live
   tune_hardware 60 30
@@ -310,17 +477,224 @@ cmd_headless() {
 }
 
 
-# Run the optional POST_RESTORE_HOOK with the window background work was stopped.
-run_post_restore_hook() {
-  [[ -f $STATE/stopped_at ]] || return 0
-  if [[ -z $POST_RESTORE_HOOK ]]; then rm -f "$STATE/stopped_at"; return 0; fi
-  hdr "post-restore hook"
-  if POWERSAVE_STOPPED_AT=$(cat "$STATE/stopped_at") POWERSAVE_RESTORED_AT=$(date -Iseconds) \
-       bash -c "$POST_RESTORE_HOOK"; then
-    say "hook ran"; rm -f "$STATE/stopped_at"
+# --- restore: workloads ----------------------------------------------------
+# Sort what save recorded by its on-restore policy: auto -> START, never ->
+# dropped from state, ask -> one numbered entry per rule (containers matching the
+# same glob share an entry). ASK_KEY / ASK_NAMES / ASK_LABEL are parallel arrays.
+classify_restore() {
+  local kind f n pat pol fl lb key i items
+  START=() ASK_KEY=() ASK_NAMES=() ASK_LABEL=()
+  declare -gA ASK_IDX=()
+  for kind in system-unit user-unit container; do
+    f=$(state_file "$kind"); [[ -s $f ]] || continue
+    mapfile -t items < "$f"
+    for n in "${items[@]}"; do
+      [[ -n $n ]] || continue
+      IFS='|' read -r pat pol fl lb <<< "$(workload_rule "$kind" "$n")"
+      case $pol in
+        auto)  START+=("$kind|$n") ;;
+        never) say "left stopped (never): $n"; forget "$f" "$n" ;;
+        *)     key="$kind|$pat"
+               if [[ -n ${ASK_IDX[$key]+x} ]]; then i=${ASK_IDX[$key]}; ASK_NAMES[i]+=" $n"
+               else ASK_IDX[$key]=${#ASK_KEY[@]}; ASK_KEY+=("$key"); ASK_NAMES+=("$n"); ASK_LABEL+=("$lb"); fi ;;
+      esac
+    done
+  done
+}
+
+# How an ask entry is shown: its name, or its glob and a count for a group.
+ask_entry() {  # ask_entry INDEX
+  local names label=${ASK_LABEL[$1]} pat=${ASK_KEY[$1]#*|}
+  read -ra names <<< "${ASK_NAMES[$1]}"
+  if (( ${#names[@]} > 1 )); then
+    printf '%-22s %s' "$pat" "${label:+$label }(${#names[@]} $(kind_name "${ASK_KEY[$1]%%|*}"))"
   else
-    say "hook failed; it runs again on the next 'powersave restore'"
+    printf '%-22s %s' "${names[0]}" "${label:-(no label)}"
   fi
+}
+
+# Offer the ask entries once. Sets PICK[i]=1 for each entry to restart.
+choose_restart() {  # choose_restart yes|no|ask
+  local n=${#ASK_KEY[@]} i
+  PICK=()
+  for ((i = 0; i < n; i++)); do PICK[i]=0; done
+  (( n )) || return 0
+  say "These were stopped and are set to ask before restarting:"
+  for ((i = 0; i < n; i++)); do printf '    %d) %s\n' $((i + 1)) "$(ask_entry "$i")"; done
+  case $1 in
+    yes) say "--yes: restarting all of them"; for ((i = 0; i < n; i++)); do PICK[i]=1; done; return 0 ;;
+    no)  say "--no: leaving them stopped"; return 0 ;;
+  esac
+  if ! interactive; then
+    if [[ ${SET[unattended]} == restart ]]; then
+      say "no terminal: restarting them (unattended restart)"
+      for ((i = 0; i < n; i++)); do PICK[i]=1; done
+    else
+      say "no terminal: leaving them stopped (unattended skip)"
+    fi
+    return 0
+  fi
+  # read every answer from one open terminal, so a re-ask reads the next line
+  ask_loop < "$TTY" 2>/dev/null || say "could not read $TTY - leaving them stopped; restore offers them again"
+  return 0
+}
+
+ask_loop() {
+  local n=${#ASK_KEY[@]} i ans tok toks ok tries=0 dflt=${SET[ask_default]}
+  while :; do
+    if [[ $dflt == yes ]]; then printf '  Restart? [Y]es all / [n]one / numbers e.g. "1 3"  (Enter = yes, %s s): ' "${SET[ask_timeout]}"
+    else printf '  Restart? [y]es all / [N]one / numbers e.g. "1 3"  (Enter = no, %s s): ' "${SET[ask_timeout]}"; fi
+    ans=
+    if ! read -r -t "${SET[ask_timeout]}" ans && [[ -z $ans ]]; then
+      echo; say "no answer - using the default ($dflt)"
+    fi
+    ans=$(trim "${ans,,}"); ans=${ans//,/ }
+    [[ -z $ans ]] && ans=$dflt
+    case $ans in
+      y|yes|a|all) for ((i = 0; i < n; i++)); do PICK[i]=1; done; return 0 ;;
+      n|no|none)   return 0 ;;
+    esac
+    ok=1; read -ra toks <<< "$ans"
+    for tok in "${toks[@]}"; do [[ $tok =~ ^[0-9]+$ ]] && (( 10#$tok >= 1 && 10#$tok <= n )) || ok=0; done
+    if (( ok )); then
+      for tok in "${toks[@]}"; do PICK[10#$tok - 1]=1; done
+      return 0
+    fi
+    if (( tries++ )); then
+      say "'$ans' is still not valid - restarting none of them; restore offers them again"
+      return 0
+    fi
+    say "'$ans' is not valid: answer y, n, or numbers from 1 to $n"
+  done
+}
+
+start_one() {  # start_one KIND NAME
+  case $1 in
+    system-unit) sudo systemctl start "$2" ;;
+    user-unit)   systemctl --user start "$2" ;;
+    container)   docker start "$2" ;;
+  esac >/dev/null 2>&1
+}
+
+# Start every START entry of KIND; drop the ones that came up from state.
+start_kind() {
+  local e n f ok=() bad=()
+  f=$(state_file "$1")
+  for e in "${START[@]}"; do
+    [[ ${e%%|*} == "$1" ]] || continue
+    n=${e#*|}
+    if start_one "$1" "$n"; then ok+=("$n"); forget "$f" "$n"; else bad+=("$n"); fi
+  done
+  (( ${#ok[@]} )) && say "$(kind_name "$1") restarted: ${ok[*]}"
+  (( ${#bad[@]} )) && say "$(kind_name "$1") that failed to start (kept for the next restore): ${bad[*]}"
+  return 0
+}
+
+docker_up() {  # wait up to ~15 s for the docker daemon
+  local i
+  for ((i = 0; i < 15; i++)); do docker info >/dev/null 2>&1 && return 0; sleep 1; done
+  return 1
+}
+
+restore_workloads() {  # restore_workloads yes|no|ask
+  local i n names e want_c=0
+  classify_restore
+  choose_restart "$1"
+  for i in "${!ASK_KEY[@]}"; do
+    (( PICK[i] )) || continue
+    read -ra names <<< "${ASK_NAMES[i]}"
+    for n in "${names[@]}"; do START+=("${ASK_KEY[i]%%|*}|$n"); done
+  done
+  # system units first: docker has to be up before any container starts
+  start_kind system-unit
+  start_kind user-unit
+  for e in "${START[@]}"; do [[ $e == container\|* ]] && want_c=1; done
+  if (( want_c )); then
+    if docker_up; then start_kind container
+    else say "docker is not up - containers stay recorded; run 'powersave restore' again once it is"; fi
+  fi
+  for i in "${!ASK_KEY[@]}"; do
+    (( PICK[i] )) || say "still stopped: $(trim "$(ask_entry "$i")")"
+  done
+  return 0
+}
+
+# --- restore: coverage gap and POST_RESTORE_HOOK -----------------------------
+# Is a container with the backfill flag (the recorder) running?
+recorder_running() {
+  local c pat pol fl lb
+  while read -r c; do
+    [[ -n $c ]] || continue
+    IFS='|' read -r pat pol fl lb <<< "$(workload_rule container "$c")"
+    has_flag backfill "$fl" && return 0
+  done < <(docker ps --format '{{.Names}}' 2>/dev/null)
+  return 1
+}
+
+# Set a window marker aside without deleting it.
+skip_marker() { [[ -f $STATE/$1 ]] && mv "$STATE/$1" "$STATE/$1.skipped-$(date +%Y%m%dT%H%M%S)"; }
+
+# window_ok MARKER: 0 = hand it to the hook, 1 = declined (set aside),
+# 2 = too old and nobody to ask (left as it is). Only an explicit y approves a
+# window older than backfill_max_age_h; --yes does not.
+window_ok() {
+  local f=$STATE/$1 age ans what=Coverage\ gap
+  [[ $1 == stopped_at ]] && what="Background work stop"
+  age=$(hours_since "$f")
+  (( age <= SET[backfill_max_age_h] )) && return 0
+  if ! interactive; then
+    say "$what started $(cat "$f") ($age h ago), older than ${SET[backfill_max_age_h]} h: left as it is (no terminal to ask)"
+    return 2
+  fi
+  printf '  %s started %s (%s h ago). Backfill all of it? [y/N] ' "$what" "$(cat "$f")" "$age"
+  ans=
+  read -r -t "${SET[ask_timeout]}" ans 2>/dev/null < "$TTY" || echo
+  case ${ans,,} in y|yes) return 0 ;; esac
+  skip_marker "$1"
+  say "declined: nothing was queued (kept as $1.skipped-*)"
+  return 1
+}
+
+# A stopped recorder leaves outage_start, the coverage gap; POST_RESTORE_HOOK gets
+# that window once a recorder is running again. Without a gap it gets stopped_at,
+# when background work stopped. Either way the hook runs once per restore.
+run_post_restore_hook() {
+  local m rc
+  if [[ -f $STATE/outage_start ]]; then
+    hdr "coverage gap"
+    if ! recorder_running; then
+      say "gap since $(cat "$STATE/outage_start") kept: no recorder (backfill flag) is running"
+      say "  'powersave restore' offers the backfill again once it is up"
+      return 0
+    fi
+  elif [[ -f $STATE/stopped_at ]]; then
+    hdr "post-restore hook"
+  else
+    return 0
+  fi
+  if [[ -z $POST_RESTORE_HOOK ]]; then
+    [[ -f $STATE/outage_start ]] && { skip_marker outage_start; say "no POST_RESTORE_HOOK set: nothing was queued for the gap (kept as outage_start.skipped-*)"; }
+    rm -f "$STATE/stopped_at"
+    return 0
+  fi
+  for m in outage_start stopped_at; do
+    [[ -f $STATE/$m ]] || continue
+    window_ok "$m"; rc=$?
+    (( rc == 2 )) && return 0
+    if (( rc == 1 )); then
+      # a stop marker from the same outage is just as old; set it aside too
+      [[ $m == outage_start && -f $STATE/stopped_at ]] && (( $(hours_since "$STATE/stopped_at") > SET[backfill_max_age_h] )) \
+        && skip_marker stopped_at
+      continue
+    fi
+    if POWERSAVE_STOPPED_AT=$(cat "$STATE/$m") POWERSAVE_RESTORED_AT=$(date -Iseconds) \
+         bash -c "$POST_RESTORE_HOOK"; then
+      say "hook ran for the window since $(cat "$STATE/$m")"; rm -f "$STATE/outage_start" "$STATE/stopped_at"
+    else
+      say "hook failed; it runs again on the next 'powersave restore'"
+    fi
+    return 0
+  done
 }
 
 # One-command switch to the console tier. Records the VT you came from, arms a
@@ -343,7 +717,7 @@ cmd_go_headless() {
   sudo chvt 3 2>/dev/null || chvt 3 2>/dev/null || say "could not switch VT - press Ctrl+Alt+F3 manually"
 }
 
-cmd_restore() {
+cmd_restore() {  # cmd_restore yes|no|ask (what to do with ask workloads)
   hdr "restoring"
   if [[ -f $HOOK_STATE/active ]]; then
     # Still on battery: go back to the AC hook's limits; the hook lifts them when AC returns.
@@ -376,13 +750,7 @@ cmd_restore() {
       sudo modprobe nvidia 2>/dev/null && sudo modprobe nvidia_modeset 2>/dev/null && say "nvidia driver reloaded"
     fi
   fi
-  [[ -s $STATE/sys_units ]]  && { while read -r u; do sudo systemctl start "$u" 2>/dev/null; done < "$STATE/sys_units"; say "system units restarted"; rm -f "$STATE/sys_units"; }
-  [[ -s $STATE/user_units ]] && { while read -r u; do systemctl --user start "$u" 2>/dev/null; done < "$STATE/user_units"; say "user units restarted"; rm -f "$STATE/user_units"; }
-  if [[ -s $STATE/containers ]]; then
-    sleep 3
-    docker start $(cat "$STATE/containers") >/dev/null 2>&1 && say "containers restarted: $(tr '\n' ' ' < "$STATE/containers")"
-    rm -f "$STATE/containers"
-  fi
+  restore_workloads "${1:-ask}"
   run_post_restore_hook
   rm -f "$STATE/pending-headless"
   if [[ -f $STATE/display_manager ]]; then
@@ -392,23 +760,36 @@ cmd_restore() {
     sleep 4; sudo chvt "$vt" 2>/dev/null && say "switched back to VT $vt"
     rm -f "$STATE/return_vt"
   fi
+  [[ -s $STATE/apps ]] && say "apps left closed (never reopened): $(tr '\n' ' ' < "$STATE/apps")"
   rm -f "$STATE/apps"
   hdr "done"; battery
   say "Apps that were closed are not reopened - launch them yourself."
 }
 
-case "${1:-status}" in
-  status)   cmd_status ;;
-  go-headless) cmd_go_headless ;;
-  limit)    cmd_limit ;;
-  perf)     hdr "full performance"
-            sudo sh -c "echo 0 > $PSTATE/no_turbo; echo 100 > $PSTATE/max_perf_pct" 2>/dev/null
-            rm -f "$STATE/cpu"
-            say "turbo on, max_perf=100% (on battery this is ~30-45 min under load)"
-            battery ;;
-  unlimit)  cmd_unlimit ;;
-  save)     cmd_save "$@" ;;
-  headless) cmd_headless ;;
-  restore)  cmd_restore ;;
-  *) echo "usage: powersave {status | limit | unlimit | perf | save [--gpu-off|--aggressive|--dry-run] | go-headless | headless | restore}"; exit 1 ;;
-esac
+main() {
+  load_workloads
+  case "${1:-status}" in
+    status)   cmd_status ;;
+    go-headless) cmd_go_headless ;;
+    limit)    cmd_limit ;;
+    perf)     hdr "full performance"
+              sudo sh -c "echo 0 > $PSTATE/no_turbo; echo 100 > $PSTATE/max_perf_pct" 2>/dev/null
+              rm -f "$STATE/cpu"
+              say "turbo on, max_perf=100% (on battery this is ~30-45 min under load)"
+              battery ;;
+    unlimit)  cmd_unlimit ;;
+    save)     cmd_save "$@" ;;
+    headless) cmd_headless ;;
+    restore)  case ${2:-} in
+                --yes) cmd_restore yes ;;
+                --no)  cmd_restore no ;;
+                '')    cmd_restore ask ;;
+                *)     usage ;;
+              esac ;;
+    *) usage ;;
+  esac
+}
+usage() { echo "usage: powersave {status | limit | unlimit | perf | save [--gpu-off|--aggressive|--dry-run] | go-headless | headless | restore [--yes|--no]}"; exit 1; }
+
+# Sourcing the script (tests/run.sh) loads the functions without running anything.
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"

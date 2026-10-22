@@ -39,7 +39,13 @@ if on_ac; then
   [[ -f $VAR/brightness ]] && cat "$VAR/brightness" > $BL/brightness 2>/dev/null
   rm -f "$VAR/active" "$VAR/cpu" "$VAR/brightness"
   logger -t powersave "AC restored: limits removed"
-  notify "Power restored" "Full performance restored."
+  msg="Full performance restored."
+  # Point at workloads `powersave save` left stopped. Never start anything from here.
+  for f in /home/*/.local/state/powersave/{containers,user_units,sys_units}; do
+    [[ -s $f ]] && { msg="$msg
+Some workloads are still stopped - run: powersave restore"; break; }
+  done
+  notify "Power restored" "$msg"
 else
   [[ -f $VAR/active ]] && exit 0
   echo "$(cat $PSTATE/no_turbo) $(cat $PSTATE/max_perf_pct)" > "$VAR/cpu"

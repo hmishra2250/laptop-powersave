@@ -1,0 +1,84 @@
+# powersave workloads: what `powersave save` stops, what it keeps running, and
+# what `powersave restore` does with each thing it stopped.
+#
+# install.sh copies this file to ~/.config/powersave/workloads only if that file
+# does not exist yet, so your edits are never overwritten. Point POWERSAVE_WORKLOADS
+# at another file to use that instead. Delete the file to go back to the built-in
+# defaults (the lists in /etc/powersave.conf, everything restarted automatically).
+# While this file exists, SYS_UNITS, USER_UNITS, HEADLESS_USER_UNITS and APPS in
+# powersave.conf are ignored: list everything here.
+#
+# Each workload is one line of whitespace-separated columns:
+#
+#   <kind> <name-or-glob> <on-restore> [flags]   # label
+#
+# kind         container     a Docker container, by name
+#              user-unit     a systemd --user unit
+#              system-unit   a system unit (stopped and started with sudo)
+#              app           a desktop app, closed by process name; never reopened
+# name         the container, unit or process name. Containers may use a glob
+#              (* ? [...]) such as supabase_*_zoe-auto; other kinds may not.
+#              The first line that matches a name wins.
+# on-restore   auto    restart it without asking
+#              ask     offer it at the restore prompt
+#              never   leave it stopped
+# flags        optional, comma separated, no spaces:
+#              keep      save leaves it running (it is never stopped or recorded)
+#              backfill  the CCTV recorder: stopping it starts a coverage gap, and
+#                        restore hands that gap to POST_RESTORE_HOOK once a
+#                        recorder is running again
+#              headless  user units only: stopped only by the headless tier
+# label        text after #, shown next to the item at the restore prompt
+#
+# Containers that run but match no line get the unlisted_container policy below.
+# Everything after # on a line is a comment; blank lines are ignored.
+#
+# The coverage gap is queued by POST_RESTORE_HOOK (set in /etc/powersave.conf or
+# ~/.config/powersave/config). It runs with POWERSAVE_STOPPED_AT (gap start) and
+# POWERSAVE_RESTORED_AT (now) set; without a hook nothing is queued.
+
+# --- containers ----------------------------------------------------------
+container  cctv-edge-app-1      ask   backfill   # Frigate, CCTV recorder
+container  cctv-edge-go2rtc-1   ask              # go2rtc, camera stream relay
+container  zoe-mailpit          auto             # Zoe dev mail catcher
+container  supabase_*_zoe-auto  ask              # Zoe local Supabase stack
+
+# --- user units ----------------------------------------------------------
+user-unit  cctv-edge-backfill.service  auto            # CCTV backfill worker
+user-unit  idle-keeper.service         auto            # idle keeper
+user-unit  talkies.service             auto  headless  # talkies (needs the desktop and the dGPU)
+
+# --- system units --------------------------------------------------------
+system-unit  docker.socket                auto
+system-unit  docker.service               auto
+system-unit  containerd.service           auto
+system-unit  ModemManager.service         auto
+system-unit  virtlockd.socket             auto
+system-unit  virtlogd.socket              auto
+system-unit  virtlockd.service            auto
+system-unit  virtlogd.service             auto
+system-unit  kerneloops.service           auto
+system-unit  fwupd.service                auto
+system-unit  unattended-upgrades.service  auto
+system-unit  bluetooth.service            auto
+
+# --- apps (closed by save, never reopened) -------------------------------
+app  slack    never
+app  zoom     never
+app  obsidian never
+app  spotify  never
+app  discord  never
+
+# --- settings: <key> <value> ---------------------------------------------
+# Seconds the restore prompt waits for an answer.
+ask_timeout         30
+# What Enter or no answer means at the restore prompt: yes | no.
+ask_default         yes
+# What ask items do when restore has no terminal (for example run from a
+# script): skip (leave them stopped and offer them next time) | restart.
+unattended          skip
+# A coverage gap older than this many hours is only backfilled after an
+# explicit y at the prompt (--yes does not approve it).
+backfill_max_age_h  24
+# Policy for running containers that match no line above: auto | ask | never.
+unlisted_container  ask
