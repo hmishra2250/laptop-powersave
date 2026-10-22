@@ -52,9 +52,9 @@ else
   echo 1 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null
   if command -v iw >/dev/null; then for w in $WIFI_IF; do iw dev "$w" set power_save on 2>/dev/null; done; fi
   # free the dGPU only if nothing holds it (never forces, never kills)
-  if lsmod | grep -q '^nvidia' && ! fuser -s /dev/nvidia* 2>/dev/null; then
+  if grep -q '^nvidia' /proc/modules && ! fuser -s /dev/nvidia* 2>/dev/null; then
     for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do modprobe -r "$m" 2>/dev/null; done
-    lsmod | grep -q '^nvidia' || [[ -z $DGPU ]] || echo auto > /sys/bus/pci/devices/$DGPU/power/control 2>/dev/null
+    grep -q '^nvidia' /proc/modules || [[ -z $DGPU ]] || echo auto > /sys/bus/pci/devices/$DGPU/power/control 2>/dev/null
   fi
   touch "$VAR/active"
   logger -t powersave "on battery: CPU capped ${CAP_PCT}%, turbo off, screen ${CAP_BRIGHT}%"

@@ -85,10 +85,10 @@ battery() {
 # Try to release the dGPU without touching anything persistent. Only succeeds if
 # nothing holds nvidia_drm (i.e. the session already came up on Intel, or gdm is down).
 gpu_release() {
-  lsmod | grep -q '^nvidia' || { say "dGPU: already unloaded ($(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null))"; return 0; }
+  grep -q '^nvidia' /proc/modules || { say "dGPU: already unloaded ($(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null))"; return 0; }
   sudo systemctl stop nvidia-persistenced 2>/dev/null
   for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do sudo modprobe -r "$m" 2>/dev/null; done
-  if lsmod | grep -q '^nvidia'; then
+  if grep -q '^nvidia' /proc/modules; then
     say "dGPU: still held by the display session (~10W)"
     say "  -> run 'powersave save --gpu-off' to reclaim it (costs one logout)"
     return 1
@@ -119,7 +119,7 @@ cmd_status() {
   hdr "power"; battery
   [[ -r $PSTATE/no_turbo ]] && say "cpu: turbo=$([[ $(cat $PSTATE/no_turbo) == 1 ]] && echo off || echo on) max_perf=$(cat $PSTATE/max_perf_pct)%"
   [[ -r $BL/brightness ]] && say "screen: $(( $(cat $BL/brightness) * 100 / $(cat $BL/max_brightness) ))%"
-  if lsmod | grep -q '^nvidia'; then
+  if grep -q '^nvidia' /proc/modules; then
     say "dGPU: driver LOADED, $(nvidia-smi --query-gpu=power.draw --format=csv,noheader 2>/dev/null || echo '?') (power state $(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null))"
   else
     say "dGPU: driver unloaded, power state $(cat /sys/bus/pci/devices/$DGPU/power_state 2>/dev/null) <- powered down"
@@ -266,7 +266,7 @@ cmd_save() {
   gpu_release || true
   if [[ ${2:-} == --gpu-off ]]; then gpu_off_persistent && return 0; fi
   hdr "done"; battery
-  if lsmod | grep -q '^nvidia'; then
+  if grep -q '^nvidia' /proc/modules; then
     say "Next tier:  powersave save --gpu-off    (~10W, one logout, keeps browser)"
   else
     say "Next tier:  powersave headless          (~8W, console only, no browser)"
@@ -297,7 +297,7 @@ cmd_headless() {
   hdr "powering down dGPU"
   sudo systemctl stop nvidia-persistenced 2>/dev/null
   for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do sudo modprobe -r "$m" 2>/dev/null; done
-  if lsmod | grep -q '^nvidia'; then
+  if grep -q '^nvidia' /proc/modules; then
     say "still loaded; holders:"; sudo fuser -v /dev/nvidia* 2>&1 | head -5   # -v only: never -k
   else
     sudo sh -c "echo auto > /sys/bus/pci/devices/$DGPU/power/control" 2>/dev/null
@@ -366,7 +366,7 @@ cmd_restore() {
       && say "prime mode restored to $(cat "$STATE/prime_mode") (applies at next login)"
     rm -f "$STATE/prime_mode"
   fi
-  if ! lsmod | grep -q '^nvidia'; then
+  if ! grep -q '^nvidia' /proc/modules; then
     # Loading nvidia_modeset re-inits KMS and will kill an X session that came up
     # on the iGPU. Only safe with no graphical session running.
     if [[ $(systemctl is-active gdm 2>/dev/null) == active ]]; then
