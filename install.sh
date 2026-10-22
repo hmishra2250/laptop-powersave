@@ -18,6 +18,7 @@ if [[ ${1:-} == --uninstall ]]; then
   sudo systemctl daemon-reload; sudo udevadm control --reload-rules
   remove_profile_block
   echo "removed (kept /etc/powersave.conf, ~/.local/state/powersave and /var/lib/powersave)"
+  [[ -f ~/.config/powersave/workloads ]] && echo "kept your workloads file: ~/.config/powersave/workloads"
   exit 0
 fi
 
@@ -27,6 +28,13 @@ sudo install -m755 system/powersave-ac /usr/local/sbin/powersave-ac
 sudo install -m644 system/powersave-ac.service /etc/systemd/system/
 sudo install -m644 system/99-powersave-ac.rules /etc/udev/rules.d/
 [[ -f /etc/powersave.conf ]] || sudo install -m644 system/powersave.conf /etc/powersave.conf
+# The workloads file is yours once it exists: never overwrite it.
+if [[ -f ~/.config/powersave/workloads ]]; then
+  echo "kept your ~/.config/powersave/workloads (template: system/workloads.example)"
+else
+  install -D -m644 system/workloads.example ~/.config/powersave/workloads
+  echo "created ~/.config/powersave/workloads from system/workloads.example - edit it to choose what powersave touches"
+fi
 sudo systemctl daemon-reload
 sudo udevadm control --reload-rules
 

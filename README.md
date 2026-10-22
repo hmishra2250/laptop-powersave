@@ -25,12 +25,12 @@ This was written for one laptop and has only been run there. It expects:
 
 On replug it puts back the CPU and brightness values it saved. It does not undo the device power saving or reload the NVIDIA driver. Runtime power management can cause dropouts on some USB devices (docks, network adapters, disks).
 
-The install also copies `powersave` to `~/.local/bin`, copies `system/powersave.conf` to `/etc/powersave.conf` if that file does not exist, and adds a block to `~/.profile` (used by `go-headless`, see below).
+The install also copies `powersave` to `~/.local/bin`, copies `system/powersave.conf` to `/etc/powersave.conf` and `system/workloads.example` to `~/.config/powersave/workloads` if those files do not exist, and adds a block to `~/.profile` (used by `go-headless`, see below).
 
 ## Warnings
 
 - **`save --aggressive` closes your programs without asking.** It sends SIGTERM to every process you own that uses more than about 20 MB of memory and does not match a short allowlist (terminal, tmux, browsers, the desktop shell and system services, plus `KEEP_EXTRA`). Editors, IDEs, virtual machines, databases and builds are closed. Run `powersave save --dry-run` first to see the list.
-- **`save` stops every running Docker container**, the system units in `SYS_UNITS` (Docker, containerd, libvirt log and lock daemons, Bluetooth, fwupd, ModemManager and others), the user units in `USER_UNITS`, and closes the apps in `APPS`, without asking.
+- **`save` stops background workloads without asking.** With the built-in defaults that is every running Docker container, the system units in `SYS_UNITS` (Docker, containerd, libvirt log and lock daemons, Bluetooth, fwupd, ModemManager and others), the user units in `USER_UNITS`, and the apps in `APPS`. With a workloads file (see [Choosing what powersave touches](#choosing-what-powersave-touches)) it is everything listed there except items flagged `keep`, plus running containers the file does not list. Run `powersave save --dry-run` to see the list first.
 - **`save --gpu-off` can leave a black screen.** It runs `sudo prime-select intel` and restarts gdm. On a laptop whose screen or external ports are wired only to the NVIDIA card (or whose firmware is set to discrete-only graphics), the desktop may not come back. The PRIME mode stays on Intel across reboots until you run `powersave restore`. It asks you to type YES first; `FORCE=1` skips that.
 - **`save --gpu-off`, `go-headless` and `headless` end the graphical session.** Unsaved work in GUI apps is lost. Work inside tmux survives.
 - **Settings can stay changed.** `restore` does not turn device power saving back off, does not restart `nvidia-persistenced`, and does not turn off `loginctl enable-linger`. If you skip `restore`, the CPU cap, PRIME mode and stopped services also stay as they are. A reboot resets everything except the PRIME mode, linger and the installed files.
@@ -58,21 +58,23 @@ The NVIDIA driver cannot be unloaded while Xorg, gnome-shell or mutter hold it o
 
 ## Use
 
-    powersave status                  battery, draw, hours left, what was stopped
+    powersave status                  battery, draw, hours left, workloads source, what is still stopped
     powersave limit                   apply tier 0 by hand
     powersave unlimit                 remove tier 0 limits
     powersave perf                    turbo on, no CPU cap
     powersave save                    tier 1
     powersave save --gpu-off          tier 2 (asks you to type YES)
     powersave save --aggressive       tier 1, then close other large programs (no prompt)
-    powersave save --dry-run          list what --aggressive would close; changes nothing
+    powersave save --dry-run          list what save would stop and keep, and what --aggressive would close; changes nothing
     powersave go-headless             asks YES, then switches to tty3; log in there and tier 3 runs
     powersave headless                tier 3 directly; refuses to run inside a graphical session
-    powersave restore                 undo the tiers and restart what was stopped
+    powersave restore                 undo the tiers; restart what was stopped (auto), ask about the rest (ask)
+    powersave restore --yes           same, and restart every ask item without prompting
+    powersave restore --no            same, and leave every ask item stopped
 
 `save` reads one option at a time: `save --gpu-off --aggressive` runs `--gpu-off` only.
 
-You can go deeper in steps, for example `save` and later `save --gpu-off`. `restore` restarts everything stopped along the way. It does not reopen closed apps. If you run `restore` while still on battery, the CPU and screen go back to the tier 0 limits, and the AC hook lifts them when the charger is back.
+You can go deeper in steps, for example `save` and later `save --gpu-off`. `restore` deals with everything stopped along the way, each item by its on-restore policy. It does not reopen closed apps. If you run `restore` while still on battery, the CPU and screen go back to the tier 0 limits, and the AC hook lifts them when the charger is back.
 
 `go-headless` turns on `loginctl enable-linger` so your user services keep running without a session, and leaves a marker that the `~/.profile` block picks up on the next console login. That block runs `powersave headless` and then opens the tmux session `work`.
 
@@ -82,9 +84,55 @@ Edit `/etc/powersave.conf`. The `powersave` command also reads `~/.config/powers
 
 - `CAP_PCT`, `CAP_BRIGHT`: tier 0 CPU cap and screen brightness.
 - `BACKLIGHT`, `DGPU_PCI`, `WIFI_IF`: hardware names. When `DGPU_PCI` or `WIFI_IF` is empty, the first NVIDIA display device and all wireless interfaces are found in sysfs.
-- `SYS_UNITS`, `USER_UNITS`, `HEADLESS_USER_UNITS`, `APPS`: what `save` and `headless` stop.
+- `SYS_UNITS`, `USER_UNITS`, `HEADLESS_USER_UNITS`, `APPS`: what `save` and `headless` stop when there is no workloads file. A workloads file replaces all four.
 - `KEEP_EXTRA`: extra patterns `--aggressive` must not close.
-- `POST_RESTORE_HOOK`: an optional command, off by default. `restore` runs it after restarting everything, with `POWERSAVE_STOPPED_AT` and `POWERSAVE_RESTORED_AT` set to the start and end of the time background work was stopped, for example to tell a recorder or sync job to catch up. If it fails, the next `restore` runs it again.
+- `POST_RESTORE_HOOK`: an optional command, off by default. `restore` runs it after restarting everything, with `POWERSAVE_STOPPED_AT` and `POWERSAVE_RESTORED_AT` set to the start and end of the time background work was stopped, for example to tell a recorder or sync job to catch up. If it fails, the next `restore` runs it again. When a recorder (a container with the `backfill` flag) was stopped, the window starts when the recorder stopped and the hook waits until a recorder is running again; see below.
+
+## Choosing what powersave touches
+
+`~/.config/powersave/workloads` decides what `save` stops, what it keeps running, and what `restore` does with each thing it stopped. `install.sh` creates it from `system/workloads.example` (written for the laptop this was built on) if it does not exist, and never overwrites it. `POWERSAVE_WORKLOADS` points at another file. Without the file, the lists in `powersave.conf` apply, every running container is stopped, everything is restarted without asking, and containers named `cctv-edge-app-*` or `*frigate*` count as the recorder.
+
+One workload per line, whitespace-separated; `#` starts a comment, and the comment on a workload line is its label at the restore prompt:
+
+    <kind> <name-or-glob> <on-restore> [flags]   # label
+
+    container    cctv-edge-app-1      ask   backfill   # Frigate, CCTV recorder
+    container    supabase_*_zoe-auto  ask              # Zoe local Supabase stack
+    container    zoe-mailpit          auto             # Zoe dev mail catcher
+    user-unit    talkies.service      auto  headless
+    system-unit  bluetooth.service    auto
+    app          slack                never
+
+- kind: `container`, `user-unit`, `system-unit` or `app`. Only containers take globs. The first matching line wins.
+- on-restore: `auto` restarts it, `ask` offers it at the restore prompt, `never` leaves it stopped. Apps are never reopened whatever this says.
+- flags (comma list): `keep` (save leaves it running), `backfill` (the recorder: stopping it starts a coverage gap), `headless` (a user unit stopped only by the headless tier).
+- settings, one `key value` per line: `ask_timeout` (seconds, default 30), `ask_default` (`yes` or `no`, default yes), `unattended` (`skip` or `restart`, default skip), `backfill_max_age_h` (default 24), `unlisted_container` (`auto`, `ask` or `never`; default `ask` when the file exists).
+
+Unknown or invalid lines are reported and skipped; a bad on-restore value is treated as `ask`.
+
+### Restore
+
+`restore` starts system units first (Docker has to be up before containers), then user units, then containers, after waiting up to about 15 seconds for `docker info`. If Docker is not up it says so and keeps the containers recorded. `auto` items restart, `never` items are reported as left stopped and forgotten, and `ask` items are offered once, as one list. Containers that match the same glob share one entry:
+
+      These were stopped and are set to ask before restarting:
+        1) cctv-edge-app-1        Frigate, CCTV recorder
+        2) cctv-edge-go2rtc-1     go2rtc, camera stream relay
+        3) supabase_*_zoe-auto    Zoe local Supabase stack (11 containers)
+      Restart? [Y]es all / [n]one / numbers e.g. "1 3"  (Enter = yes, 30 s):
+
+Enter or no answer within `ask_timeout` uses `ask_default`. An invalid answer is asked again once, then nothing is restarted. `--yes` restarts every ask item and `--no` none. Without a terminal, `unattended` decides: `skip` leaves them stopped, `restart` restarts them. Anything left stopped stays recorded: `status` lists it under "still stopped" and the next `restore` offers it again.
+
+### Coverage gap
+
+When `save` stops a container with the `backfill` flag it records `outage_start` in the state directory. After containers start, if a recorder is running, `restore` runs `POST_RESTORE_HOOK` with that window; if no recorder is running it keeps the gap and offers it on the next `restore`. A gap older than `backfill_max_age_h` hours needs an explicit `y` at `Coverage gap started <date> (<N> h ago). Backfill all of it? [y/N]`; `--yes` does not approve it. Declined, the marker is renamed `outage_start.skipped-<time>` and nothing is queued. Without a terminal the marker is left as it is. Without a `POST_RESTORE_HOOK`, nothing is queued and the marker is set aside the same way.
+
+When the charger comes back, the AC hook's notification adds "Some workloads are still stopped - run: powersave restore" if anything is still recorded. The hook never starts anything itself.
+
+## Tests
+
+    tests/run.sh
+
+Sources `bin/powersave` into a temporary home with `docker`, `systemctl`, `sudo` and friends stubbed, and checks config parsing, save state, the restore prompt and the coverage gap guard. It never touches real services or `~/.local/state/powersave`.
 
 ## Install
 
@@ -92,7 +140,7 @@ Edit `/etc/powersave.conf`. The `powersave` command also reads `~/.config/powers
     cd laptop-powersave
     ./install.sh
 
-Running `./install.sh` again updates the installed files and replaces the `~/.profile` block; it does not overwrite an existing `/etc/powersave.conf`.
+Running `./install.sh` again updates the installed files and replaces the `~/.profile` block; it does not overwrite an existing `/etc/powersave.conf` or `~/.config/powersave/workloads`.
 
 ## Restore
 
@@ -105,7 +153,7 @@ Then log out and back in if `--gpu-off` was used, so the session starts with the
     powersave restore
     ./install.sh --uninstall
 
-This removes the installed scripts, the udev rule, the systemd service and the `~/.profile` block. It keeps `/etc/powersave.conf`, `~/.local/state/powersave` and `/var/lib/powersave`; delete them by hand if you want them gone.
+This removes the installed scripts, the udev rule, the systemd service and the `~/.profile` block. It keeps `/etc/powersave.conf`, `~/.config/powersave/workloads`, `~/.local/state/powersave` and `/var/lib/powersave`; delete them by hand if you want them gone.
 
 ## Design notes
 
